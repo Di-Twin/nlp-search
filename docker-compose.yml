@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://nlp_search_owner:npg_e1RvVNES6GHj@ep-calm-bread-a1i8fb1i-pooler.ap-southeast-1.aws.neon.tech/nlp_search?sslmode=require
+      - REDIS_URL=rediss://default:AVNS_O95p6dowCmqCYs3Pv-Y@valkey-16df199-kalvium-4e7d.l.aivencloud.com:20093
+      - LOG_LEVEL=INFO
+    volumes:
+      - .:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --log-level info
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  postgres_data:
+  redis_data: 
