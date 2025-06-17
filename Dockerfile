@@ -1,5 +1,5 @@
-# Use Python 3.11 slim image as base
-FROM python:3.11-slim
+# Use Python 3.11 slim image as base with security updates
+FROM python:3.11-slim-bullseye
 
 # Set working directory
 WORKDIR /app
@@ -11,23 +11,34 @@ RUN groupadd -r appuser && useradd -r -g appuser -u 10001 appuser
 ENV DATABASE_URL=postgresql+asyncpg://nlp_search_owner:npg_e1RvVNES6GHj@ep-calm-bread-a1i8fb1i-pooler.ap-southeast-1.aws.neon.tech/nlp_search?sslmode=require
 ENV REDIS_URL=rediss://default:AVNS_O95p6dowCmqCYs3Pv-Y@valkey-16df199-kalvium-4e7d.l.aivencloud.com:20093
 ENV LOG_LEVEL=INFO
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
 
-# Install system dependencies
+# Install system dependencies and security updates
 RUN apt-get update && apt-get install -y \
     build-essential \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get upgrade -y \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /var/cache/apt/*
 
-# Copy requirements first to leverage Docker cache
-COPY requirements.txt .
+# Copy requirements files
+COPY requirements-base.txt .
+COPY requirements-ml.txt .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python dependencies with security checks
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements-base.txt && \
+    pip install --no-cache-dir -r requirements-ml.txt --timeout 300 && \
+    pip cache purge
 
 # Copy the rest of the application
 COPY . .
 
 # Change ownership of the application files to the non-root user
-RUN chown -R appuser:appuser /app
+RUN chown -R appuser:appuser /app && \
+    chmod -R 755 /app
 
 # Switch to non-root user using UID
 USER 10001
