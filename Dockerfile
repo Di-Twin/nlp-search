@@ -13,7 +13,6 @@ ENV REDIS_URL=rediss://default:AVNS_O95p6dowCmqCYs3Pv-Y@valkey-16df199-kalvium-4
 ENV LOG_LEVEL=INFO
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
-ENV PIP_NO_CACHE_DIR=1
 
 # Install system dependencies and security updates
 RUN apt-get update && apt-get install -y \
@@ -30,8 +29,7 @@ COPY requirements-ml.txt .
 # Install Python dependencies with security checks
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements-base.txt && \
-    pip install --no-cache-dir -r requirements-ml.txt --timeout 300 && \
-    pip cache purge
+    pip install --no-cache-dir -r requirements-ml.txt --timeout 300
 
 # Copy the rest of the application
 COPY . .
