@@ -15,10 +15,4 @@ services:
       - key: LOG_LEVEL
         value: INFO
     healthCheckPath: /health
-    autoDeployTrigger: commit
-    maxShutdownDelaySeconds: 30
-    scaling:
-      minInstances: 1
-      maxInstances: 1
-      targetMemoryPercent: 80
-      targetCPUPercent: 80 
+    autoDeployTrigger: commit 
