@@ -10,11 +10,9 @@ env:
   PYTHON_VERSION: '3.11'
 
 jobs:
-
   deploy:
-    needs: test
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
     
     steps:
     - uses: actions/checkout@v4
