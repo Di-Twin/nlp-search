@@ -1,514 +1,394 @@
 from typing import List, Dict, Any, Optional, Tuple
-from sqlalchemy import select, func, text, case, or_, and_
+from sqlalchemy import select, func, text, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import SQLAlchemyError
 from .models import FoodNutrition
-from .embeddings import embedding_service
-from .cache import cache_service  # Updated import
+from .embeddings import get_embedding_service
+from .cache import cache_service
 from .schemas import SearchResult, NutritionInfo
 import time
 import logging
-from .database import async_session
-import numpy as np
-from pgvector.sqlalchemy import Vector
 import asyncio
-from functools import lru_cache
 import hashlib
+from functools import lru_cache
+import gc
 
 logger = logging.getLogger(__name__)
 
-class SearchService:
+class UltraOptimizedSearchService:
+    """Ultra-fast, memory-efficient search service"""
+    
+    __slots__ = ('_session_factory', '_embedding_service', '_tsquery_cache', '_cache_hits', '_cache_misses')
+    
     def __init__(self):
+        from .database import async_session
         self._session_factory = async_session
-        self._connection_pool = None
-        
-    async def initialize(self):
-        """Initialize the search service"""
-        # Pre-warm the connection pool if needed
-        logger.info("Search service initialized")
+        self._embedding_service = get_embedding_service()
+        self._tsquery_cache = {}  # Minimal cache for tsquery
+        self._cache_hits = 0
+        self._cache_misses = 0
 
-    @lru_cache(maxsize=1000)
-    def _create_tsquery(self, query: str) -> str:
-        """Create a cached tsquery string from the input query with better typo handling"""
-        # Clean the query and create tsquery format
-        cleaned_words = [word.strip() for word in query.split() if word.strip()]
-        if not cleaned_words:
+    @lru_cache(maxsize=64)  # Small cache for common queries
+    def _build_tsquery(self, query: str) -> str:
+        """Build PostgreSQL tsquery with minimal processing"""
+        words = query.lower().split()
+        if not words:
             return ""
         
-        # For single word queries, add prefix matching for typos
-        if len(cleaned_words) == 1 and len(cleaned_words[0]) > 2:
-            word = cleaned_words[0].replace("'", "''")
-            # Add both exact and prefix matching
-            return f"{word} | {word}:*"
+        if len(words) == 1:
+            word = words[0].replace("'", "")
+            return f"{word}:*" if len(word) > 2 else word
         
-        # For multiple words, escape and join with &
-        escaped_words = [word.replace("'", "''") for word in cleaned_words]
-        return ' & '.join(escaped_words)
+        # Simple AND query for multiple words
+        clean_words = [w.replace("'", "") for w in words if len(w) > 1]
+        return " & ".join(clean_words[:4])  # Limit to 4 words max
 
-    def _generate_cache_key(self, query: str, limit: int) -> str:
-        """Generate a cache key for the search query - matches cache service format"""
-        key_string = f"search:{query.lower().strip()}:{limit}"
-        return hashlib.sha256(key_string.encode()).hexdigest()
+    @staticmethod
+    def _cache_key(query: str, limit: int) -> str:
+        """Ultra-fast cache key generation"""
+        return f"{hash(query.lower())}:{limit}"
 
-    async def _get_embedding_with_fallback(self, query: str) -> Optional[List[float]]:
-        """Get embedding with error handling and fallback"""
+    async def _get_embedding_fast(self, query: str) -> Optional[List[float]]:
+        """Fast embedding retrieval with fire-and-forget caching"""
         try:
-            # First try to get from cache
-            cached_embedding = await cache_service.get_embedding(query)
-            if cached_embedding:
-                logger.debug(f"Using cached embedding for query: {query}")
-                return cached_embedding
+            # Try cache first (fastest path)
+            cached = await cache_service.get_embedding(query)
+            if cached:
+                self._cache_hits += 1
+                return cached
             
-            # Generate new embedding
-            embedding = await embedding_service.generate_embedding(query)
+            self._cache_misses += 1
+            
+            # Generate embedding synchronously (faster than async for single queries)
+            embedding = self._embedding_service.generate_embedding(query)
+            
+            # Fire-and-forget cache storage
             if embedding:
-                # Cache the embedding
-                await cache_service.set_embedding(query, embedding)
-                logger.debug(f"Generated and cached new embedding for query: {query}")
+                asyncio.create_task(cache_service.set_embedding(query, embedding))
             
             return embedding
+            
         except Exception as e:
-            logger.warning(f"Failed to generate embedding for query '{query}': {e}")
+            logger.warning(f"Embedding failed: {e}")
             return None
 
-    async def _execute_hybrid_search(
-        self, 
-        session: AsyncSession, 
-        query: str, 
-        query_embedding: Optional[List[float]], 
-        limit: int
-    ) -> List[FoodNutrition]:
-        """Execute the hybrid search query with optimized performance and deduplication"""
+    def _build_hybrid_query(self, query: str, embedding: List[float], limit: int):
+        """Build optimized hybrid search query"""
+        from pgvector.sqlalchemy import Vector
         
-        # Create tsquery with better handling for misspellings
-        tsquery = self._create_tsquery(query)
+        # Semantic similarity
+        semantic_dist = func.cosine_distance(
+            FoodNutrition.embedding,
+            func.cast(embedding, Vector)
+        )
         
-        # Enhanced fuzzy matching for better typo handling
-        fuzzy_threshold = 0.1  # Lower threshold for better fuzzy matching
+        # Text similarity (simplified)
+        name_sim = func.similarity(FoodNutrition.food_name, query)
         
-        if query_embedding:
-            # Hybrid search with improved scoring
-            semantic_distance_expr = func.cosine_distance(
-                FoodNutrition.embedding,
-                func.cast(query_embedding, Vector)
-            )
-            
-            # Simple similarity expressions without complex case statements
-            name_similarity_expr = func.similarity(FoodNutrition.food_name, query)
-            word_similarity_expr = func.word_similarity(query, FoodNutrition.food_name)
-            
-            # Text search rank - simplified
-            if tsquery:
-                ts_query_obj = func.plainto_tsquery('english', query)
-                text_rank_expr = func.ts_rank_cd(FoodNutrition.document, ts_query_obj)
-                has_text_match = FoodNutrition.document.op('@@')(ts_query_obj)
-            else:
-                text_rank_expr = func.literal(0.0)
-                has_text_match = text('false')
-            
-            # Build WHERE conditions - simplified
-            where_conditions = or_(
-                semantic_distance_expr < 0.8,
-                name_similarity_expr > fuzzy_threshold,
-                word_similarity_expr > fuzzy_threshold,
-                has_text_match
-            )
-            
-            search_query = (
-                select(
-                    FoodNutrition,
-                    semantic_distance_expr.label('semantic_distance'),
-                    text_rank_expr.label('text_rank'),
-                    name_similarity_expr.label('name_similarity'),
-                    word_similarity_expr.label('word_similarity')
-                )
-                .where(where_conditions)
-                .order_by(
-                    # Simplified scoring
-                    (semantic_distance_expr * 0.5 + 
-                     (1.0 - text_rank_expr) * 0.2 + 
-                     (1.0 - name_similarity_expr) * 0.15 +
-                     (1.0 - word_similarity_expr) * 0.15).asc(),
-                    FoodNutrition.id.asc()
-                )
-                .limit(limit * 2)  # Get more results to account for deduplication
-            )
+        # Full-text search
+        tsquery_str = self._build_tsquery(query)
+        if tsquery_str:
+            ts_query = func.plainto_tsquery('english', query)
+            text_match = FoodNutrition.document.op('@@')(ts_query)
+            ts_rank = func.ts_rank_cd(FoodNutrition.document, ts_query)
         else:
-            # Fallback to text-only search
-            name_similarity_expr = func.similarity(FoodNutrition.food_name, query)
-            word_similarity_expr = func.word_similarity(query, FoodNutrition.food_name)
-            
-            if tsquery:
-                ts_query_obj = func.plainto_tsquery('english', query)
-                text_rank_expr = func.ts_rank_cd(FoodNutrition.document, ts_query_obj)
-                has_text_match = FoodNutrition.document.op('@@')(ts_query_obj)
-            else:
-                text_rank_expr = func.literal(0.0)
-                has_text_match = text('false')
-            
-            # Build WHERE conditions for text-only search
-            where_conditions = or_(
-                name_similarity_expr > fuzzy_threshold,
-                word_similarity_expr > fuzzy_threshold,
-                has_text_match
+            text_match = func.literal(False)
+            ts_rank = func.literal(0.0)
+        
+        # Optimized WHERE conditions (tighter thresholds for better performance)
+        conditions = or_(
+            semantic_dist < 0.6,  # Stricter semantic threshold
+            name_sim > 0.3,       # Higher name similarity threshold
+            text_match
+        )
+        
+        # Simplified scoring (fewer calculations)
+        final_score = (
+            semantic_dist * 0.5 +           # Semantic weight
+            (1.0 - name_sim) * 0.3 +        # Name similarity weight
+            (1.0 - ts_rank) * 0.2           # Text search weight
+        )
+        
+        return (
+            select(
+                FoodNutrition,
+                semantic_dist.label('sem_dist'),
+                name_sim.label('name_sim'),
+                ts_rank.label('text_rank'),
+                final_score.label('score')
             )
-            
-            search_query = (
-                select(
-                    FoodNutrition,
-                    func.literal(1.0).label('semantic_distance'),
-                    text_rank_expr.label('text_rank'),
-                    name_similarity_expr.label('name_similarity'),
-                    word_similarity_expr.label('word_similarity')
-                )
-                .where(where_conditions)
-                .order_by(
-                    (text_rank_expr * 0.4 + 
-                     name_similarity_expr * 0.3 + 
-                     word_similarity_expr * 0.3).desc(),
-                    FoodNutrition.id.asc()
-                )
-                .limit(limit * 2)
-            )
-        
-        result = await session.execute(search_query)
-        rows = result.all()
-        
-        # Additional deduplication based on food name and description similarity
-        seen_foods = set()
-        unique_results = []
-        
-        for row in rows:
-            food_key = (row[0].food_name.lower().strip(), row[0].description.lower().strip())
-            if food_key not in seen_foods:
-                seen_foods.add(food_key)
-                unique_results.append(row)
-                if len(unique_results) >= limit:
-                    break
-        
-        return unique_results
+            .where(conditions)
+            .order_by(final_score.asc(), FoodNutrition.id.asc())
+            .limit(limit)
+        )
 
-    def _format_search_results(
-        self, 
-        items: List[Tuple], 
-        query: str,
-        has_embedding: bool
-    ) -> List[SearchResult]:
-        """Format the search results efficiently with improved scoring"""
-        results = []
+    def _build_text_query(self, query: str, limit: int):
+        """Build text-only search query"""
+        name_sim = func.similarity(FoodNutrition.food_name, query)
         
-        for row in items:
-            item = row[0]  # FoodNutrition object
-            semantic_distance = row[1] if len(row) > 1 else 1.0
-            text_rank = row[2] if len(row) > 2 else 0.0
-            name_similarity = row[3] if len(row) > 3 else 0.0
-            word_similarity = row[4] if len(row) > 4 else 0.0
+        tsquery_str = self._build_tsquery(query)
+        if tsquery_str:
+            ts_query = func.plainto_tsquery('english', query)
+            text_match = FoodNutrition.document.op('@@')(ts_query)
+            ts_rank = func.ts_rank_cd(FoodNutrition.document, ts_query)
             
-            # Calculate scores with better normalization
-            semantic_score = max(0.0, 1.0 - float(semantic_distance)) if has_embedding else 0.0
-            nlp_score = min(1.0, float(text_rank)) if text_rank else 0.0
-            name_fuzzy_score = max(0.0, min(1.0, float(name_similarity))) if name_similarity else 0.0
-            word_fuzzy_score = max(0.0, min(1.0, float(word_similarity))) if word_similarity else 0.0
-            
-            # Combine the fuzzy scores
-            fuzzy_score = max(name_fuzzy_score, word_fuzzy_score)
-            
-            # Special boost for very close string matches (typo handling)
-            typo_boost = 0.0
-            if query and item.food_name:
-                query_lower = query.lower()
-                name_lower = item.food_name.lower()
-                
-                # Exact match
-                if query_lower == name_lower:
-                    typo_boost = 1.0
-                # Contains or is contained
-                elif query_lower in name_lower or name_lower in query_lower:
-                    typo_boost = 0.8
-                # Very similar (likely typo)
-                elif len(query) > 2 and len(item.food_name) > 2:
-                    import difflib
-                    similarity_ratio = difflib.SequenceMatcher(None, query_lower, name_lower).ratio()
-                    if similarity_ratio > 0.7:
-                        typo_boost = similarity_ratio * 0.9
-            
-            # Combine scores with typo boost
-            if has_embedding:
-                combined_score = (
-                    semantic_score * 0.35 + 
-                    nlp_score * 0.15 + 
-                    fuzzy_score * 0.25 + 
-                    typo_boost * 0.25
-                )
-            else:
-                combined_score = (
-                    nlp_score * 0.3 + 
-                    fuzzy_score * 0.4 + 
-                    typo_boost * 0.3
-                )
-            
-            results.append(
-                SearchResult(
-                    id=item.id,
-                    food_name=item.food_name,
-                    description=item.description,
-                    nutrition=NutritionInfo(
-                        energy_kcal=item.energy_kcal,
-                        protein_g=item.protein_g,
-                        fat_g=item.fat_g,
-                        carbohydrates_g=item.carbohydrates_g,
-                        fiber_g=item.fiber_g,
-                        minerals={
-                            "calcium_mg": item.calcium_mg,
-                            "iron_mg": item.iron_mg,
-                            "magnesium_mg": item.magnesium_mg,
-                            "phosphorus_mg": item.phosphorus_mg,
-                            "potassium_mg": item.potassium_mg,
-                            "sodium_mg": item.sodium_mg,
-                            "zinc_mg": item.zinc_mg
-                        },
-                        vitamins={
-                            "vitamin_c_mg": item.vitamin_c_mg,
-                            "thiamin_mg": item.thiamin_mg,
-                            "riboflavin_mg": item.riboflavin_mg,
-                            "niacin_mg": item.niacin_mg,
-                            "vitamin_b6_mg": item.vitamin_b6_mg,
-                            "folate_ug": item.folate_ug,
-                            "vitamin_a_ug": item.vitamin_a_ug,
-                            "vitamin_e_mg": item.vitamin_e_mg,
-                            "vitamin_d_ug": item.vitamin_d_ug
-                        }
-                    ),
-                    image_url=item.image_url,
-                    scores={
-                        "semantic": round(semantic_score, 4),
-                        "nlp": round(nlp_score, 4),
-                        "fuzzy": round(fuzzy_score, 4),
-                        "typo_boost": round(typo_boost, 4),
-                        "combined": round(combined_score, 4)
-                    }
-                )
+            conditions = or_(name_sim > 0.2, text_match)
+            order_expr = (ts_rank + name_sim * 2).desc()  # Boost name similarity
+        else:
+            conditions = name_sim > 0.2
+            ts_rank = func.literal(0.0)
+            order_expr = name_sim.desc()
+        
+        return (
+            select(
+                FoodNutrition,
+                name_sim.label('name_sim'),
+                ts_rank.label('text_rank')
             )
+            .where(conditions)
+            .order_by(order_expr, FoodNutrition.id.asc())
+            .limit(limit)
+        )
+
+    @staticmethod
+    def _fast_relevance_score(query_lower: str, name_lower: str, semantic_score: float = 0.0) -> float:
+        """Ultra-fast relevance scoring with minimal string operations"""
+        # Exact match
+        if query_lower == name_lower:
+            return 1.0
         
-        # Sort by combined score (descending) for final ranking
-        results.sort(key=lambda x: x.scores["combined"], reverse=True)
+        # Substring matches (optimized with 'in' operator)
+        if query_lower in name_lower:
+            return 0.9 - (len(name_lower) - len(query_lower)) * 0.01  # Penalize longer names slightly
         
-        return results
+        if name_lower in query_lower:
+            return 0.8
+        
+        # Use semantic or default
+        return max(semantic_score, 0.1)
+
+    def _create_result_fast(self, item: FoodNutrition, relevance: float) -> Dict[str, Any]:
+        """Create result dict directly (faster than Pydantic model)"""
+        return {
+            "id": item.id,
+            "food_name": item.food_name,
+            "description": item.description,
+            "nutrition": {
+                "energy_kcal": item.energy_kcal or 0,
+                "protein_g": item.protein_g or 0,
+                "fat_g": item.fat_g or 0,
+                "carbohydrates_g": item.carbohydrates_g or 0,
+                "fiber_g": item.fiber_g or 0,
+                "minerals": {
+                    "calcium_mg": item.calcium_mg or 0,
+                    "iron_mg": item.iron_mg or 0,
+                    "magnesium_mg": item.magnesium_mg or 0,
+                    "phosphorus_mg": item.phosphorus_mg or 0,
+                    "potassium_mg": item.potassium_mg or 0,
+                    "sodium_mg": item.sodium_mg or 0,
+                    "zinc_mg": item.zinc_mg or 0
+                },
+                "vitamins": {
+                    "vitamin_c_mg": item.vitamin_c_mg or 0,
+                    "thiamin_mg": item.thiamin_mg or 0,
+                    "riboflavin_mg": item.riboflavin_mg or 0,
+                    "niacin_mg": item.niacin_mg or 0,
+                    "vitamin_b6_mg": item.vitamin_b6_mg or 0,
+                    "folate_ug": item.folate_ug or 0,
+                    "vitamin_a_ug": item.vitamin_a_ug or 0,
+                    "vitamin_e_mg": item.vitamin_e_mg or 0,
+                    "vitamin_d_ug": item.vitamin_d_ug or 0
+                }
+            },
+            "image_url": item.image_url,
+            "relevance": round(relevance, 3)  # Single score field
+        }
 
     async def search(self, query: str, limit: int = 10, use_cache: bool = True) -> Dict[str, Any]:
-        """
-        Perform hybrid search with optimized performance and error handling
+        """Ultra-optimized search with maximum speed and minimal memory usage"""
+        start_time = time.perf_counter()
         
-        Args:
-            query: Search query string
-            limit: Maximum number of results to return
-            use_cache: Whether to use caching
-            
-        Returns:
-            Dictionary containing search results and metadata
-        """
-        start_time = time.time()
-        cache_hit = False
+        # Fast validation
+        if not query or len(query.strip()) == 0:
+            return {"results": [], "meta": {"error": "Empty query"}}
         
-        # Input validation
-        if not query or not isinstance(query, str):
-            raise ValueError("Query must be a non-empty string")
+        if not 1 <= limit <= 20:  # Reasonable limits
+            limit = min(max(limit, 1), 20)
         
-        if limit <= 0 or limit > 100:
-            raise ValueError("Limit must be between 1 and 100")
-        
-        # Clean and normalize the query
         query = query.strip()
-        if not query:
-            raise ValueError("Query cannot be empty after cleaning")
+        query_lower = query.lower()
         
-        # Check cache first using the updated cache service
-        cache_key = self._generate_cache_key(query, limit)
+        # Cache check (fastest path)
         if use_cache:
+            cache_key = self._cache_key(query, limit)
             try:
-                cached_result = await cache_service.get_search_results(query, limit)
-                if cached_result:
-                    # Add cache hit indicator
-                    cached_result["meta"]["cache"] = "HIT"
-                    cached_result["meta"]["duration_ms"] = round((time.time() - start_time) * 1000, 2)
-                    logger.info(f"Cache HIT for query: '{query}' (limit: {limit})")
-                    return cached_result
-            except Exception as e:
-                logger.warning(f"Cache retrieval failed for query '{query}': {e}")
+                cached = await cache_service.get_search_results(query, limit)
+                if cached:
+                    cached["meta"]["cache_hit"] = True
+                    cached["meta"]["duration_ms"] = round((time.perf_counter() - start_time) * 1000, 2)
+                    return cached
+            except Exception:
+                pass
         
-        async with self._session_factory() as session:
-            try:
-                # Get embedding with fallback and caching
-                query_embedding = await self._get_embedding_with_fallback(query)
-                has_embedding = query_embedding is not None
+        try:
+            async with self._session_factory() as session:
+                # Get embedding (non-blocking)
+                embedding = await self._get_embedding_fast(query)
+                has_embedding = embedding is not None
                 
-                # Execute search
-                search_results = await self._execute_hybrid_search(
-                    session, query, query_embedding, limit
-                )
+                # Build query based on embedding availability
+                if has_embedding:
+                    search_query = self._build_hybrid_query(query, embedding, limit + 5)  # Get a few extra for dedup
+                else:
+                    search_query = self._build_text_query(query, limit + 5)
                 
-                # Format results
-                results = self._format_search_results(search_results, query, has_embedding)
+                # Execute query
+                result = await session.execute(search_query)
+                rows = result.all()
                 
-                # Calculate duration
-                duration = (time.time() - start_time) * 1000
+                # Process results with minimal allocations
+                results = []
+                seen_names = set()
                 
-                # Prepare response
+                for row in rows:
+                    item = row[0]
+                    
+                    # Fast deduplication
+                    name_key = item.food_name.lower()
+                    if name_key in seen_names:
+                        continue
+                    seen_names.add(name_key)
+                    
+                    # Calculate relevance
+                    if has_embedding:
+                        semantic_score = max(0.0, 1.0 - float(row.sem_dist)) if hasattr(row, 'sem_dist') else 0.0
+                    else:
+                        semantic_score = 0.0
+                    
+                    relevance = self._fast_relevance_score(query_lower, name_key, semantic_score)
+                    
+                    results.append(self._create_result_fast(item, relevance))
+                    
+                    if len(results) >= limit:
+                        break
+                
+                # Sort by relevance (usually already sorted, but ensure consistency)
+                if len(results) > 1:
+                    results.sort(key=lambda x: x["relevance"], reverse=True)
+                
+                duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+                
                 response = {
                     "results": results,
                     "meta": {
-                        "duration_ms": round(duration, 2),
-                        "cache": "MISS",
+                        "duration_ms": duration_ms,
+                        "cache_hit": False,
                         "total_results": len(results),
-                        "query": query,
                         "embedding_used": has_embedding,
-                        "limit": limit
+                        "cache_stats": f"{self._cache_hits}/{self._cache_hits + self._cache_misses}"
                     }
                 }
                 
-                # Cache the result using the updated cache service
+                # Fire-and-forget cache storage
                 if use_cache and results:
-                    try:
-                        await cache_service.set_search_results(query, limit, response)
-                        logger.info(f"Cached search results for query: '{query}' (limit: {limit})")
-                    except Exception as e:
-                        logger.warning(f"Cache storage failed for query '{query}': {e}")
+                    asyncio.create_task(cache_service.set_search_results(query, limit, response))
                 
-                logger.info(f"Search completed for query: '{query}' - {len(results)} results in {duration:.2f}ms")
                 return response
                 
-            except SQLAlchemyError as e:
-                logger.error(f"Database error in search: {str(e)}")
-                await session.rollback()
-                raise
-            except Exception as e:
-                logger.error(f"Unexpected error in search: {str(e)}")
-                await session.rollback()
-                raise
+        except Exception as e:
+            logger.error(f"Search error: {e}")
+            return {
+                "results": [],
+                "meta": {
+                    "error": str(e),
+                    "duration_ms": round((time.perf_counter() - start_time) * 1000, 2)
+                }
+            }
 
-    async def search_by_nutrition(
-        self, 
-        nutrition_filters: Dict[str, Any], 
-        limit: int = 10
-    ) -> Dict[str, Any]:
-        """
-        Search foods by nutritional criteria
+    async def search_by_nutrition(self, filters: Dict[str, Any], limit: int = 10) -> Dict[str, Any]:
+        """Optimized nutrition search with minimal overhead"""
+        start_time = time.perf_counter()
         
-        Args:
-            nutrition_filters: Dict containing nutritional filters
-            limit: Maximum number of results
-            
-        Returns:
-            Dictionary containing search results and metadata
-        """
-        start_time = time.time()
+        if not filters or limit < 1:
+            return {"results": [], "meta": {"error": "Invalid parameters"}}
         
-        async with self._session_factory() as session:
-            try:
+        try:
+            async with self._session_factory() as session:
                 query = select(FoodNutrition)
                 
-                # Apply nutritional filters
-                for key, value in nutrition_filters.items():
-                    if hasattr(FoodNutrition, key) and value is not None:
-                        if isinstance(value, dict):
-                            # Range filter: {"min": 10, "max": 50}
-                            if "min" in value:
-                                query = query.where(getattr(FoodNutrition, key) >= value["min"])
-                            if "max" in value:
-                                query = query.where(getattr(FoodNutrition, key) <= value["max"])
-                        else:
-                            # Exact match or minimum value
-                            query = query.where(getattr(FoodNutrition, key) >= value)
+                # Apply filters efficiently (validate attribute exists)
+                valid_attrs = {
+                    'energy_kcal', 'protein_g', 'fat_g', 'carbohydrates_g', 'fiber_g',
+                    'calcium_mg', 'iron_mg', 'magnesium_mg', 'phosphorus_mg', 
+                    'potassium_mg', 'sodium_mg', 'zinc_mg', 'vitamin_c_mg'
+                }
                 
-                query = query.limit(limit)
+                for key, value in filters.items():
+                    if key not in valid_attrs or value is None:
+                        continue
+                    
+                    attr = getattr(FoodNutrition, key)
+                    
+                    if isinstance(value, dict):
+                        if "min" in value and value["min"] is not None:
+                            query = query.where(attr >= value["min"])
+                        if "max" in value and value["max"] is not None:
+                            query = query.where(attr <= value["max"])
+                    elif isinstance(value, (int, float)):
+                        query = query.where(attr >= value)
+                
+                # Order by energy for consistency
+                query = query.order_by(FoodNutrition.energy_kcal.desc()).limit(min(limit, 20))
+                
                 result = await session.execute(query)
                 items = result.scalars().all()
                 
-                # Format results (without scores since this is nutrition-based)
-                results = []
-                for item in items:
-                    results.append(
-                        SearchResult(
-                            id=item.id,
-                            food_name=item.food_name,
-                            description=item.description,
-                            nutrition=NutritionInfo(
-                                energy_kcal=item.energy_kcal,
-                                protein_g=item.protein_g,
-                                fat_g=item.fat_g,
-                                carbohydrates_g=item.carbohydrates_g,
-                                fiber_g=item.fiber_g,
-                                minerals={
-                                    "calcium_mg": item.calcium_mg,
-                                    "iron_mg": item.iron_mg,
-                                    "magnesium_mg": item.magnesium_mg,
-                                    "phosphorus_mg": item.phosphorus_mg,
-                                    "potassium_mg": item.potassium_mg,
-                                    "sodium_mg": item.sodium_mg,
-                                    "zinc_mg": item.zinc_mg
-                                },
-                                vitamins={
-                                    "vitamin_c_mg": item.vitamin_c_mg,
-                                    "thiamin_mg": item.thiamin_mg,
-                                    "riboflavin_mg": item.riboflavin_mg,
-                                    "niacin_mg": item.niacin_mg,
-                                    "vitamin_b6_mg": item.vitamin_b6_mg,
-                                    "folate_ug": item.folate_ug,
-                                    "vitamin_a_ug": item.vitamin_a_ug,
-                                    "vitamin_e_mg": item.vitamin_e_mg,
-                                    "vitamin_d_ug": item.vitamin_d_ug
-                                }
-                            ),
-                            image_url=item.image_url,
-                            scores={}
-                        )
-                    )
-                
-                duration = (time.time() - start_time) * 1000
+                # Create results efficiently
+                results = [self._create_result_fast(item, 1.0) for item in items]
                 
                 return {
                     "results": results,
                     "meta": {
-                        "duration_ms": round(duration, 2),
-                        "total_results": len(results),
-                        "filters": nutrition_filters,
-                        "limit": limit
+                        "duration_ms": round((time.perf_counter() - start_time) * 1000, 2),
+                        "total_results": len(results)
                     }
                 }
                 
-            except SQLAlchemyError as e:
-                logger.error(f"Database error in nutrition search: {str(e)}")
-                await session.rollback()
-                raise
-            except Exception as e:
-                logger.error(f"Unexpected error in nutrition search: {str(e)}")
-                await session.rollback()
-                raise
-
-    async def health_check(self) -> Dict[str, Any]:
-        """Check the health of the search service"""
-        try:
-            async with self._session_factory() as session:
-                # Simple query to test database connectivity
-                result = await session.execute(select(func.count(FoodNutrition.id)))
-                total_foods = result.scalar()
-                
-                return {
-                    "status": "healthy",
-                    "total_foods": total_foods,
-                    "embedding_service": await embedding_service.health_check() if hasattr(embedding_service, 'health_check') else "unknown"
-                }
         except Exception as e:
-            logger.error(f"Health check failed: {e}")
+            logger.error(f"Nutrition search error: {e}")
             return {
-                "status": "unhealthy",
-                "error": str(e)
+                "results": [],
+                "meta": {
+                    "error": str(e),
+                    "duration_ms": round((time.perf_counter() - start_time) * 1000, 2)
+                }
             }
 
-# Create a singleton instance
-search_service = SearchService()
+    def get_stats(self) -> Dict[str, Any]:
+        """Get service statistics"""
+        cache_info = self._build_tsquery.cache_info()
+        return {
+            "tsquery_cache": cache_info._asdict(),
+            "embedding_cache_hits": self._cache_hits,
+            "embedding_cache_misses": self._cache_misses,
+            "hit_ratio": self._cache_hits / max(self._cache_hits + self._cache_misses, 1)
+        }
+
+    def clear_caches(self):
+        """Clear all caches to free memory"""
+        self._build_tsquery.cache_clear()
+        self._cache_hits = 0
+        self._cache_misses = 0
+        gc.collect()
+
+# Global singleton instance
+search_service = UltraOptimizedSearchService()
 
 async def init_search_service():
-    """Initialize the search service"""
-    await search_service.initialize()
-    logger.info("Search service initialization completed")
+    """Initialize search service (minimal setup)"""
+    logger.info("Ultra-optimized search service initialized")
+
+# Convenience function for direct search
+async def quick_search(query: str, limit: int = 10) -> Dict[str, Any]:
+    """Direct search function for performance-critical paths"""
+    return await search_service.search(query, limit, use_cache=True)

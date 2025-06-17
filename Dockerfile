@@ -17,10 +17,10 @@ COPY requirements-base.txt .
 COPY requirements-ml.txt .
 
 # Install base dependencies
-RUN pip install --no-cache-dir -r requirements-base.txt
+RUN pip install -r requirements-base.txt
 
 # Install ML dependencies with increased timeout
-RUN pip install --no-cache-dir -r requirements-ml.txt --timeout 300
+RUN pip install -r requirements-ml.txt --timeout 300
 
 # Copy application code
 COPY . .
