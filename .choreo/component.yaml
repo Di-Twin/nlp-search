@@ -54,4 +54,28 @@ configurations:
           displayName: Log Level
           type: string
           required: false
-          default: INFO 
+          default: INFO
+
+  # +optional List of files to be injected into the component
+  file:
+    # +required name of the file
+    - name: logging.yaml
+      # +required path to mount the file at
+      mountPath: /app/config
+      # +required file type
+      type: yaml
+      # +required define keys of the file
+      values:
+        - name: version
+          valueFrom:
+            configForm:
+              displayName: Logging Version
+              type: string
+              required: false
+              default: "1.0"
+
+  # +optional List of volumes to be mounted
+  volumes:
+    - name: app-data
+      mountPath: /app/data
+      type: emptyDir 

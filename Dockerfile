@@ -1,45 +1,32 @@
-# Use Python 3.11 slim image as base with security updates
-FROM python:3.11-slim-bullseye
+FROM python:3.11-slim
 
-# Set working directory
 WORKDIR /app
 
-# Create a non-root user with specific UID between 10000-20000
-RUN groupadd -r appuser && useradd -r -g appuser -u 10001 appuser
-
-# Set environment variables
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-
-# Install system dependencies and security updates
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
-    && apt-get upgrade -y \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/* \
-    && rm -rf /var/cache/apt/*
+    ca-certificates \
+    openssl \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements files
+# Configure pip to use longer timeouts
+RUN pip config set global.timeout 300
+
+# Copy requirements first to leverage Docker cache
 COPY requirements-base.txt .
 COPY requirements-ml.txt .
 
-# Install Python dependencies with security checks
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements-base.txt && \
-    pip install --no-cache-dir -r requirements-ml.txt --timeout 300
+# Install base dependencies
+RUN pip install --no-cache-dir -r requirements-base.txt
 
-# Copy the rest of the application
+# Install ML dependencies with increased timeout
+RUN pip install --no-cache-dir -r requirements-ml.txt --timeout 300
+
+# Copy application code
 COPY . .
-
-# Change ownership of the application files to the non-root user
-RUN chown -R appuser:appuser /app && \
-    chmod -R 755 /app
-
-# Switch to non-root user using UID
-USER 10001
 
 # Expose port
 EXPOSE 8000
 
-# Command to run the application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--log-level", "info"] 
+# Run the application
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"] 
