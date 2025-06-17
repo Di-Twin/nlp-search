@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: food-nlp-search
+    runtime: python
+    plan: free
+    buildCommand: |
+      pip install -r requirements-base.txt
+      pip install -r requirements-ml.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: LOG_LEVEL
+        value: INFO
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    maxShutdownDelaySeconds: 30
+    scaling:
+      minInstances: 1
+      maxInstances: 1
+      targetMemoryPercent: 80
+      targetCPUPercent: 80 
