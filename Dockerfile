@@ -1,32 +1,30 @@
+# Use Python 3.11 slim image as base
 FROM python:3.11-slim
 
+# Set working directory
 WORKDIR /app
+
+# Set environment variables
+ENV DATABASE_URL=postgresql+asyncpg://nlp_search_owner:npg_e1RvVNES6GHj@ep-calm-bread-a1i8fb1i-pooler.ap-southeast-1.aws.neon.tech/nlp_search?sslmode=require
+ENV REDIS_URL=rediss://default:AVNS_O95p6dowCmqCYs3Pv-Y@valkey-16df199-kalvium-4e7d.l.aivencloud.com:20093
+ENV LOG_LEVEL=INFO
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
-    ca-certificates \
-    openssl \
     && rm -rf /var/lib/apt/lists/*
 
-# Configure pip to use longer timeouts
-RUN pip config set global.timeout 300
-
 # Copy requirements first to leverage Docker cache
-COPY requirements-base.txt .
-COPY requirements-ml.txt .
+COPY requirements.txt .
 
-# Install base dependencies
-RUN pip install --no-cache-dir -r requirements-base.txt
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Install ML dependencies with increased timeout
-RUN pip install --no-cache-dir -r requirements-ml.txt --timeout 300
-
-# Copy application code
+# Copy the rest of the application
 COPY . .
 
 # Expose port
 EXPOSE 8000
 
-# Run the application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"] 
+# Command to run the application
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--log-level", "info"] 
