@@ -4,8 +4,8 @@ FROM python:3.11-slim
 # Set working directory
 WORKDIR /app
 
-# Create a non-root user
-RUN groupadd -r appuser && useradd -r -g appuser appuser
+# Create a non-root user with specific UID between 10000-20000
+RUN groupadd -r appuser && useradd -r -g appuser -u 10001 appuser
 
 # Set environment variables
 ENV DATABASE_URL=postgresql+asyncpg://nlp_search_owner:npg_e1RvVNES6GHj@ep-calm-bread-a1i8fb1i-pooler.ap-southeast-1.aws.neon.tech/nlp_search?sslmode=require
@@ -29,8 +29,8 @@ COPY . .
 # Change ownership of the application files to the non-root user
 RUN chown -R appuser:appuser /app
 
-# Switch to non-root user
-USER appuser
+# Switch to non-root user using UID
+USER 10001
 
 # Expose port
 EXPOSE 8000
