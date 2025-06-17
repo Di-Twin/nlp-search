@@ -1,0 +1,57 @@
+# +required The configuration file schema version
+schemaVersion: 1.2
+
+# +optional Incoming connection details for the component
+endpoints:
+  # +required Unique name for the endpoint
+  - name: food-search-api
+    # +optional Display name for the endpoint
+    displayName: Food Search API
+    # +required Service section has the user service endpoint details
+    service:
+      # +optional Context (base path) of the API that gets exposed via the endpoint
+      basePath: /api
+      # +required Numeric port value that gets exposed via the endpoint
+      port: 8000
+    # +required Type of traffic that the endpoint is accepting
+    type: REST
+    # +optional Network level visibilities of the endpoint
+    networkVisibilities: 
+      - Public
+
+
+# +optional Outgoing connection details for the component
+dependencies:
+  # +optional Defines the connection references
+  connectionReferences:
+    # Database connection
+    - name: postgres-db
+      resourceRef: service:/Database/PostgreSQL/v1/ad088/PUBLIC
+    # Redis connection
+    - name: redis-cache
+      resourceRef: service:/Cache/Redis/v1/ad088/PUBLIC
+
+# +optional Defines runtime configurations
+configurations:
+  # +optional List of environment variables to be injected into the component
+  env:
+    # Database configuration
+    - name: DATABASE_URL
+      valueFrom:
+        connectionRef:
+          name: postgres-db
+          key: ConnectionString
+    # Redis configuration
+    - name: REDIS_URL
+      valueFrom:
+        connectionRef:
+          name: redis-cache
+          key: ConnectionString
+    # Logging configuration
+    - name: LOG_LEVEL
+      valueFrom:
+        configForm:
+          displayName: Log Level
+          type: string
+          required: false
+          default: INFO 

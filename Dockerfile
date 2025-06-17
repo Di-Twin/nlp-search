@@ -8,9 +8,6 @@ WORKDIR /app
 RUN groupadd -r appuser && useradd -r -g appuser -u 10001 appuser
 
 # Set environment variables
-ENV DATABASE_URL=postgresql+asyncpg://nlp_search_owner:npg_e1RvVNES6GHj@ep-calm-bread-a1i8fb1i-pooler.ap-southeast-1.aws.neon.tech/nlp_search?sslmode=require
-ENV REDIS_URL=rediss://default:AVNS_O95p6dowCmqCYs3Pv-Y@valkey-16df199-kalvium-4e7d.l.aivencloud.com:20093
-ENV LOG_LEVEL=INFO
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
