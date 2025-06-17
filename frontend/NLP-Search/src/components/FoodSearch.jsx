@@ -22,7 +22,7 @@ const FoodSearch = () => {
             setError(null);
 
             try {
-                const response = await axios.post('http://localhost:8000/api/search', {
+                const response = await axios.post('https://food-nlp-search.onrender.com/api/search', {
                     query: searchQuery,
                     limit: 8
                 }, {
